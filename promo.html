@@ -128,14 +128,13 @@
         if (LOCATION_ID === 'EY0n2rtraCf6EEUKpaEE' || API_KEY === 'pit-e475c122-5128-42e9-97e9-e2ceb26f1401') {
           throw new Error('API credentials not configured. Replace LOCATION_ID and API_KEY in the code.');
         }
-
         // Fetch opportunities
         const response = await fetch(
           `https://api.gohighlevel.com/v1/opportunities?locationId=$EY0n2rtraCf6EEUKpaEE&status=Open`,
           {
             method: 'GET',
             headers: {
-              'Authorization': `Bearer $pit-e475c122-5128-42e9-97e9-e2ceb26f1401`,
+             'Authorization': `Bearer ${pit-e475c122-5128-42e9-97e9-e2ceb26f1401}`,
               'Content-Type': 'application/json'
             }
           }
