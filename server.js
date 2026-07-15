@@ -193,6 +193,48 @@ app.get("/custom-fields", async (req, res) => {
   }
 });
 
+// ---- Debug: see what GHL actually returns (names, pipelines, custom fields) ----
+// Visit https://your-service.onrender.com/debug during setup, then remove/ignore.
+app.get("/debug", async (req, res) => {
+  if (!GHL_PIT || !GHL_LOCATION_ID) {
+    return res
+      .status(500)
+      .json({ error: "Server not configured: set GHL_PIT and GHL_LOCATION_ID." });
+  }
+  try {
+    const opps = await fetchOpportunities();
+    res.json({
+      totalOpportunities: opps.length,
+      activeFilter: PROMO_PIPELINE_ID
+        ? `pipelineId === ${PROMO_PIPELINE_ID}`
+        : `name contains one of: ${PROMO_KEYWORDS}`,
+      matchedAsPromotions: opps.filter(passesFilter).length,
+      opportunities: opps.map((o) => ({
+        id: o.id,
+        name: o.name,
+        status: o.status,
+        pipelineId: o.pipelineId,
+        pipelineStageId: o.pipelineStageId,
+        contact: o.contact
+          ? { name: o.contact.name, email: o.contact.email }
+          : null,
+        customFields: (o.customFields || []).map((f) => ({
+          id: f.id || f.customFieldId || f.key,
+          value:
+            f.fieldValue ??
+            f.value ??
+            f.field_value ??
+            f.fieldValueString ??
+            f.selectedOptions ??
+            "",
+        })),
+      })),
+    });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Smart 1 promos proxy listening on ${PORT}`);
 });
