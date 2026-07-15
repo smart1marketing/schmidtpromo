@@ -131,6 +131,21 @@ function valueById(opp, id) {
   return Array.isArray(v) ? v.join(", ") : String(v ?? "");
 }
 
+// Make a date value readable. Leaves already-readable text (e.g. "August 1, 2026")
+// alone; converts epoch numbers and ISO dates to "Aug 1, 2026".
+function formatDateValue(v) {
+  if (!v) return "";
+  const s = String(v).trim();
+  let d = null;
+  if (/^\d{13}$/.test(s)) d = new Date(Number(s));           // ms epoch
+  else if (/^\d{10}$/.test(s)) d = new Date(Number(s) * 1000); // s epoch
+  else if (/^\d{4}-\d{2}-\d{2}/.test(s)) d = new Date(s);      // ISO date
+  if (d && !isNaN(d.getTime())) {
+    return d.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
+  }
+  return s; // leave human-typed dates as-is
+}
+
 function toPromotion(opp, idMap) {
   const out = { id: opp.id };
   for (const [key, outName] of Object.entries(FIELD_MAP)) {
@@ -138,6 +153,18 @@ function toPromotion(opp, idMap) {
   }
   // Promotion Name falls back to the opportunity's own title
   if (!out.name) out.name = opp.name || "";
+
+  // Clean up dates
+  out.start = formatDateValue(out.start);
+  out.end = formatDateValue(out.end);
+
+  // Combine Description + Promo code / necessary item into one "details" line
+  if (out.promoCode) {
+    out.details = [out.details, "Promo Code / Item: " + out.promoCode]
+      .filter(Boolean)
+      .join("\n\n");
+  }
+
   // Contact from the linked contact record
   const c = opp.contact || {};
   out.contact =
