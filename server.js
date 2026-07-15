@@ -277,17 +277,37 @@ app.get("/debug", async (req, res) => {
   try {
     const idMap = await resolveFieldIds();
     const scope = await resolvePromoScope();
+
+    // id -> field name, so we can label the raw values
+    const defs = await ghlGet(
+      `/locations/${encodeURIComponent(GHL_LOCATION_ID)}/customFields?model=opportunity`
+    );
+    const nameById = {};
+    for (const f of defs.customFields || []) nameById[f.id] = f.name;
+
     const opps = await fetchOpportunities(scope.pipelineId);
     const matched = opps.filter((o) => isPromotion(o, idMap, scope));
     const enriched = await Promise.all(matched.slice(0, 3).map(enrichIfNeeded));
+
+    const rawValue = (f) =>
+      f.fieldValue ?? f.value ?? f.field_value ?? f.fieldValueString ??
+      f.fieldValueArray ?? f.selectedOptions ?? "";
+
     res.json({
-      resolvedFieldIds: idMap,
       chosenScope: scope,
       lookingFor: { pipelineName: PROMO_PIPELINE_NAME, stageName: PROMO_STAGE_NAME },
       opportunitiesInPipeline: opps.length,
       matchedAsPromotions: matched.length,
-      stagesSeen: [...new Set(opps.map((o) => o.pipelineStageId))],
       mappedSample: enriched.map((o) => toPromotion(o, idMap)),
+      // What each matched opportunity ACTUALLY has filled in:
+      matchedFieldsSample: enriched.map((o) => ({
+        id: o.id,
+        title: o.name,
+        customFieldsFilled: (o.customFields || []).map((f) => ({
+          field: nameById[f.id || f.customFieldId] || f.id,
+          value: rawValue(f),
+        })),
+      })),
     });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message });
