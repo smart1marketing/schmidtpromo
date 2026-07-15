@@ -242,16 +242,30 @@ function isPromotion(opp, idMap, scope) {
   return !!valueById(opp, idMap.promo_name);
 }
 
+// A real promotion has at least one Promo field filled in. This hides the event
+// bookings that sit in the same stage but have no promo data. (We can't require
+// "Promo Name" specifically, because the promo name may live in the opportunity
+// title rather than the custom field.)
+const PROMO_DATA_KEYS = [
+  "promo_name",
+  "this_promo_is_for",
+  "promo_start_date",
+  "promo_end_date",
+  "description_of_promo",
+  "promo_code_or_neccessary_item",
+];
+function hasPromoData(opp, idMap) {
+  return PROMO_DATA_KEYS.some((k) => valueById(opp, idMap[k]));
+}
+
 async function buildPromotions() {
   const idMap = await resolveFieldIds();
   const scope = await resolvePromoScope();
   const opps = await fetchOpportunities(scope.pipelineId);
   const inScope = opps.filter((o) => isPromotion(o, idMap, scope));
   const enriched = await Promise.all(inScope.map(enrichIfNeeded));
-  // Only real promotions: must have a Promo Name filled in.
-  // (Hides event bookings in the same stage that have no promo fields.)
   return enriched
-    .filter((o) => valueById(o, idMap.promo_name))
+    .filter((o) => hasPromoData(o, idMap))
     .map((o) => toPromotion(o, idMap));
 }
 
@@ -317,8 +331,10 @@ app.get("/debug", async (req, res) => {
     for (const f of defs.customFields || []) nameById[f.id] = f.name;
 
     const opps = await fetchOpportunities(scope.pipelineId);
-    const matched = opps.filter((o) => isPromotion(o, idMap, scope));
-    const enriched = await Promise.all(matched.slice(0, 3).map(enrichIfNeeded));
+    const inScope = opps.filter((o) => isPromotion(o, idMap, scope));
+    const enrichedAll = await Promise.all(inScope.map(enrichIfNeeded));
+    const promos = enrichedAll.filter((o) => hasPromoData(o, idMap));
+    const enriched = promos.slice(0, 3);
 
     const rawValue = (f) =>
       f.fieldValue ?? f.value ?? f.field_value ?? f.fieldValueString ??
@@ -328,7 +344,8 @@ app.get("/debug", async (req, res) => {
       chosenScope: scope,
       lookingFor: { pipelineName: PROMO_PIPELINE_NAME, stageName: PROMO_STAGE_NAME },
       opportunitiesInPipeline: opps.length,
-      matchedAsPromotions: matched.length,
+      opportunitiesInStage: inScope.length,
+      promotionsShown: promos.length,
       mappedSample: enriched.map((o) => toPromotion(o, idMap)),
       // What each matched opportunity ACTUALLY has filled in:
       matchedFieldsSample: enriched.map((o) => ({
