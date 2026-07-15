@@ -41,6 +41,9 @@ const {
   GHL_LOCATION_ID,
   ALLOWED_ORIGIN = "*",
   PROMO_PIPELINE_ID = "",
+  PROMO_PIPELINE_NAME = "Schmidt Marketing Projects", // pipeline to match by name
+  PROMO_STAGE_ID = "",
+  PROMO_STAGE_NAME = "Upcoming Events", // stage within that pipeline to show
   PORT = 10000,
 } = process.env;
 
@@ -142,25 +145,83 @@ function toPromotion(opp, idMap) {
   return out;
 }
 
-function isPromotion(opp, idMap) {
-  if (PROMO_PIPELINE_ID) return opp.pipelineId === PROMO_PIPELINE_ID;
-  // Otherwise: treat it as a promotion if the promo_name field is filled
-  return !!valueById(opp, idMap.promo_name);
+let promoScope = null; // { pipelineId, stageId } resolved once
+
+async function getPipelines() {
+  const data = await ghlGet(
+    `/opportunities/pipelines?locationId=${encodeURIComponent(GHL_LOCATION_ID)}`
+  );
+  return data.pipelines || [];
 }
 
-async function fetchOpportunities() {
-  const path =
+// Resolve the pipeline + stage that hold promotions (explicit id wins, else by name).
+async function resolvePromoScope() {
+  if (promoScope) return promoScope;
+  const pipelines = await getPipelines();
+
+  let pipeline = null;
+  if (PROMO_PIPELINE_ID) {
+    pipeline = pipelines.find((p) => p.id === PROMO_PIPELINE_ID) || { id: PROMO_PIPELINE_ID, stages: [] };
+  } else {
+    const needle = PROMO_PIPELINE_NAME.toLowerCase();
+    pipeline = pipelines.find((p) => (p.name || "").toLowerCase().includes(needle)) || null;
+  }
+
+  let stageId = "";
+  if (pipeline) {
+    if (PROMO_STAGE_ID) {
+      stageId = PROMO_STAGE_ID;
+    } else if (PROMO_STAGE_NAME) {
+      const sNeedle = PROMO_STAGE_NAME.toLowerCase();
+      const stage = (pipeline.stages || []).find((s) =>
+        (s.name || "").toLowerCase().includes(sNeedle)
+      );
+      stageId = stage ? stage.id : "";
+    }
+  }
+
+  promoScope = { pipelineId: pipeline ? pipeline.id : "", stageId };
+  return promoScope;
+}
+
+async function fetchOpportunities(pipelineId) {
+  let path =
     `/opportunities/search?location_id=${encodeURIComponent(GHL_LOCATION_ID)}&limit=100`;
+  if (pipelineId) path += `&pipeline_id=${encodeURIComponent(pipelineId)}`;
   const data = await ghlGet(path);
   return data.opportunities || [];
 }
 
+// Some search results omit customFields; fetch the full opportunity if needed.
+async function enrichIfNeeded(opp) {
+  if (Array.isArray(opp.customFields) && opp.customFields.length) return opp;
+  try {
+    const data = await ghlGet(`/opportunities/${encodeURIComponent(opp.id)}`);
+    const full = data.opportunity || data;
+    if (Array.isArray(full.customFields)) opp.customFields = full.customFields;
+  } catch {
+    /* leave as-is if the detail call fails */
+  }
+  return opp;
+}
+
+function isPromotion(opp, idMap, scope) {
+  if (scope.pipelineId) {
+    if (opp.pipelineId !== scope.pipelineId) return false;
+    if (scope.stageId && opp.pipelineStageId !== scope.stageId) return false;
+    return true;
+  }
+  // No promo pipeline found: fall back to "promo_name is filled"
+  return !!valueById(opp, idMap.promo_name);
+}
+
 async function buildPromotions() {
   const idMap = await resolveFieldIds();
-  const opps = await fetchOpportunities();
-  return opps
-    .filter((o) => isPromotion(o, idMap))
-    .map((o) => toPromotion(o, idMap));
+  const scope = await resolvePromoScope();
+  const opps = await fetchOpportunities(scope.pipelineId);
+  const matched = opps.filter((o) => isPromotion(o, idMap, scope));
+  const enriched = await Promise.all(matched.map(enrichIfNeeded));
+  return enriched.map((o) => toPromotion(o, idMap));
 }
 
 // ---- Routes ----
@@ -191,21 +252,42 @@ app.get("/promotions", async (req, res) => {
   }
 });
 
+// List pipelines + their stages (name + id) so we can confirm the promo scope.
+app.get("/pipelines", async (req, res) => {
+  if (!configOK(res)) return;
+  try {
+    const pipelines = await getPipelines();
+    res.json({
+      chosenScope: await resolvePromoScope(),
+      lookingFor: { pipelineName: PROMO_PIPELINE_NAME, stageName: PROMO_STAGE_NAME },
+      pipelines: pipelines.map((p) => ({
+        id: p.id,
+        name: p.name,
+        stages: (p.stages || []).map((s) => ({ id: s.id, name: s.name })),
+      })),
+    });
+  } catch (err) {
+    res.status(err.status || 502).json({ error: err.message });
+  }
+});
+
 // Raw diagnostics: field-id resolution + what GHL returns for opportunities.
 app.get("/debug", async (req, res) => {
   if (!configOK(res)) return;
   try {
     const idMap = await resolveFieldIds();
-    const opps = await fetchOpportunities();
+    const scope = await resolvePromoScope();
+    const opps = await fetchOpportunities(scope.pipelineId);
+    const matched = opps.filter((o) => isPromotion(o, idMap, scope));
+    const enriched = await Promise.all(matched.slice(0, 3).map(enrichIfNeeded));
     res.json({
       resolvedFieldIds: idMap,
-      totalOpportunities: opps.length,
-      matchedAsPromotions: opps.filter((o) => isPromotion(o, idMap)).length,
-      filter: PROMO_PIPELINE_ID
-        ? `pipelineId === ${PROMO_PIPELINE_ID}`
-        : "opportunities where promo_name is filled",
-      rawSample: opps.slice(0, 2),
-      mappedSample: opps.slice(0, 3).map((o) => toPromotion(o, idMap)),
+      chosenScope: scope,
+      lookingFor: { pipelineName: PROMO_PIPELINE_NAME, stageName: PROMO_STAGE_NAME },
+      opportunitiesInPipeline: opps.length,
+      matchedAsPromotions: matched.length,
+      stagesSeen: [...new Set(opps.map((o) => o.pipelineStageId))],
+      mappedSample: enriched.map((o) => toPromotion(o, idMap)),
     });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message });
