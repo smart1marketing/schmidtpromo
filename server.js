@@ -219,9 +219,13 @@ async function buildPromotions() {
   const idMap = await resolveFieldIds();
   const scope = await resolvePromoScope();
   const opps = await fetchOpportunities(scope.pipelineId);
-  const matched = opps.filter((o) => isPromotion(o, idMap, scope));
-  const enriched = await Promise.all(matched.map(enrichIfNeeded));
-  return enriched.map((o) => toPromotion(o, idMap));
+  const inScope = opps.filter((o) => isPromotion(o, idMap, scope));
+  const enriched = await Promise.all(inScope.map(enrichIfNeeded));
+  // Only real promotions: must have a Promo Name filled in.
+  // (Hides event bookings in the same stage that have no promo fields.)
+  return enriched
+    .filter((o) => valueById(o, idMap.promo_name))
+    .map((o) => toPromotion(o, idMap));
 }
 
 // ---- Routes ----
