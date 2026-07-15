@@ -1,32 +1,33 @@
 /**
  * Smart 1 Suite — Promotions Proxy
  * --------------------------------------------------------------
- * This tiny web service is the ONLY place the GoHighLevel Private
- * Integration Token lives. The public promotions page calls THIS
- * service; this service calls GoHighLevel. The token is never sent
- * to the browser.
+ * The GoHighLevel Private Integration Token lives ONLY here (as an
+ * environment variable). The public promotions page calls this service;
+ * this service calls GoHighLevel. The token never reaches the browser.
  *
- * This follows GoHighLevel's own guidance: the Private Integration
- * Token is stored as a secure server environment variable.
+ * DATA_SOURCE controls where promotions come from:
+ *   "form"        (default) reads submissions from a specific form.
+ *                 Simplest: no workflow / opportunity setup needed.
+ *   "opportunity" reads Opportunities (needs a form->opportunity workflow
+ *                 in Suite; use this if you want pipeline/stage logic).
  *
  * Environment variables (set these in the Render dashboard):
- *   GHL_PIT          (required)  Your Private Integration Token: pit-xxxxxxxx...
+ *   GHL_PIT          (required)  Private Integration Token: pit-xxxx...
  *   GHL_LOCATION_ID  (required)  The sub-account / location ID
- *   ALLOWED_ORIGIN   (optional)  Origin allowed to read this feed.
- *                                Default "*" (fine — this feed is public promo info).
- *                                To lock it down: https://your-promos-domain.com
+ *   DATA_SOURCE      (optional)  "form" (default) or "opportunity"
+ *   FORM_ID          (required for form mode) e.g. HiSs6ID0Yw8nu5ISjech
+ *   ALLOWED_ORIGIN   (optional)  Default "*" (this feed is public promo info)
  *
- * Custom field mapping (set the ones you use — get IDs from GET /custom-fields):
- *   CF_AUDIENCE_ID   Custom field ID for "This Promotion is for"
- *   CF_START_ID      Custom field ID for the promotion Start date
- *   CF_END_ID        Custom field ID for the promotion End date
- *   CF_DETAILS_ID    Custom field ID for the promotion Details/Description
+ * PIT scopes needed:
+ *   form mode        -> forms.readonly
+ *   opportunity mode -> opportunities.readonly (+ locations/customFields.readonly)
  *
- * Optional filtering:
- *   PROMO_PIPELINE_ID   If set, only opportunities in this pipeline are returned.
- *   PROMO_KEYWORDS      Comma-separated keywords; if set (and no pipeline id),
- *                       only opportunities whose name matches are returned.
- *                       Default: "promo,sale,offer,discount,deal"
+ * Field mapping (form mode auto-detects by label; override if needed):
+ *   FIELD_NAME_KEY, FIELD_AUDIENCE_KEY, FIELD_START_KEY,
+ *   FIELD_DETAILS_KEY, FIELD_END_KEY, FIELD_CONTACT_KEY
+ *
+ * Field mapping (opportunity mode, custom field IDs from /custom-fields):
+ *   CF_AUDIENCE_ID, CF_START_ID, CF_END_ID, CF_DETAILS_ID
  */
 
 import express from "express";
@@ -39,19 +40,32 @@ const GHL_VERSION = "2021-07-28";
 const {
   GHL_PIT,
   GHL_LOCATION_ID,
+  DATA_SOURCE = "form",
+  FORM_ID = "",
   ALLOWED_ORIGIN = "*",
+
+  // form-mode field key overrides (optional)
+  FIELD_NAME_KEY = "",
+  FIELD_AUDIENCE_KEY = "",
+  FIELD_START_KEY = "",
+  FIELD_DETAILS_KEY = "",
+  FIELD_END_KEY = "",
+  FIELD_CONTACT_KEY = "",
+
+  // opportunity-mode custom field IDs (optional)
   CF_AUDIENCE_ID = "",
   CF_START_ID = "",
   CF_END_ID = "",
   CF_DETAILS_ID = "",
   PROMO_PIPELINE_ID = "",
   PROMO_KEYWORDS = "promo,sale,offer,discount,deal",
+
   PORT = 10000,
 } = process.env;
 
-// ---- Simple in-memory cache so we don't hammer the GHL API ----
+// ---- tiny cache so we don't hammer the GHL API ----
 let cache = { data: null, at: 0 };
-const CACHE_MS = 60 * 1000; // 60 seconds
+const CACHE_MS = 60 * 1000;
 
 // ---- CORS (read-only public promo data) ----
 app.use((req, res, next) => {
@@ -70,94 +84,164 @@ function ghlHeaders() {
   };
 }
 
-/**
- * Pull a custom field value off an opportunity by its field id.
- * GHL has returned custom field values under a few different keys over
- * time, so we check all of the likely ones.
- */
-function getCustomField(opp, fieldId) {
-  if (!fieldId || !Array.isArray(opp.customFields)) return "";
-  const match = opp.customFields.find(
-    (f) => f.id === fieldId || f.customFieldId === fieldId || f.key === fieldId
-  );
-  if (!match) return "";
-  const v =
-    match.fieldValue ??
-    match.value ??
-    match.field_value ??
-    match.fieldValueString ??
-    match.selectedOptions ??
-    "";
-  return Array.isArray(v) ? v.join(", ") : String(v ?? "");
-}
-
-/** Map a raw GHL opportunity to the clean shape the page renders. */
-function toPromotion(opp) {
-  const contact = opp.contact || {};
-  return {
-    id: opp.id,
-    name: opp.name || "",
-    audience: getCustomField(opp, CF_AUDIENCE_ID), // "This Promotion is for"
-    start: getCustomField(opp, CF_START_ID),
-    end: getCustomField(opp, CF_END_ID),
-    details: getCustomField(opp, CF_DETAILS_ID),
-    contact:
-      contact.email ||
-      contact.name ||
-      [contact.firstName, contact.lastName].filter(Boolean).join(" ") ||
-      "",
-    status: opp.status || "",
-  };
-}
-
-function passesFilter(opp) {
-  if (PROMO_PIPELINE_ID) return opp.pipelineId === PROMO_PIPELINE_ID;
-  const keywords = PROMO_KEYWORDS.split(",")
-    .map((k) => k.trim().toLowerCase())
-    .filter(Boolean);
-  if (keywords.length === 0) return true;
-  const name = (opp.name || "").toLowerCase();
-  return keywords.some((k) => name.includes(k));
-}
-
-async function fetchOpportunities() {
-  const url =
-    `${GHL_BASE}/opportunities/search` +
-    `?location_id=${encodeURIComponent(GHL_LOCATION_ID)}` +
-    `&limit=100`;
-
-  const resp = await fetch(url, { headers: ghlHeaders() });
+async function ghlGet(path) {
+  const resp = await fetch(`${GHL_BASE}${path}`, { headers: ghlHeaders() });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     const err = new Error(`GHL API ${resp.status}: ${body.slice(0, 300)}`);
     err.status = resp.status;
     throw err;
   }
-  const data = await resp.json();
-  return data.opportunities || [];
+  return resp.json();
 }
 
-// ---- Health check (Render pings this) ----
+/* ======================= FORM MODE ======================= */
+
+function fetchSubmissions() {
+  const path =
+    `/forms/submissions` +
+    `?locationId=${encodeURIComponent(GHL_LOCATION_ID)}` +
+    `&formId=${encodeURIComponent(FORM_ID)}` +
+    `&limit=100`;
+  return ghlGet(path).then((d) => d.submissions || d.data || []);
+}
+
+// keys that are metadata, not form answers
+const META_KEYS = new Set([
+  "id", "formId", "form_id", "contactId", "contact_id", "locationId",
+  "location_id", "createdAt", "created_at", "dateAdded", "updatedAt",
+  "pageUrl", "page_url", "eventData", "source", "medium",
+]);
+
+function stringify(v) {
+  if (v === null || v === undefined) return "";
+  if (Array.isArray(v)) return v.map(stringify).filter(Boolean).join(", ");
+  if (typeof v === "object") {
+    // GHL sometimes nests { value: "...", label: "..." }
+    if ("value" in v) return stringify(v.value);
+    return Object.values(v).map(stringify).filter(Boolean).join(", ");
+  }
+  return String(v);
+}
+
+/** Flatten a submission into simple { key: "text value" } pairs. */
+function flattenSubmission(sub) {
+  const flat = {};
+  for (const [k, v] of Object.entries(sub || {})) {
+    if (META_KEYS.has(k)) continue;
+    flat[k] = stringify(v);
+  }
+  // Some responses tuck answers under "others" or "customFields"
+  if (sub && typeof sub.others === "object") {
+    for (const [k, v] of Object.entries(sub.others)) flat[k] = stringify(v);
+  }
+  if (Array.isArray(sub && sub.customFields)) {
+    for (const f of sub.customFields) {
+      const key = f.name || f.label || f.id || f.key;
+      if (key) flat[key] = stringify(f.value ?? f.fieldValue ?? f.field_value);
+    }
+  }
+  return flat;
+}
+
+// find a value by explicit key, else by fuzzy label match
+function pick(flat, explicitKey, patterns) {
+  if (explicitKey && flat[explicitKey] !== undefined) return flat[explicitKey];
+  for (const [k, v] of Object.entries(flat)) {
+    if (!v) continue;
+    if (patterns.some((re) => re.test(k))) return v;
+  }
+  return "";
+}
+
+function submissionToPromotion(sub) {
+  const flat = flattenSubmission(sub);
+  const name = pick(flat, FIELD_NAME_KEY, [/promotion.*name/i, /^name$/i, /title/i]);
+  return {
+    id: sub.id || "",
+    name: name || "",
+    audience: pick(flat, FIELD_AUDIENCE_KEY, [/\bfor\b/i, /audience/i, /who/i]),
+    start: pick(flat, FIELD_START_KEY, [/start/i, /begin/i]),
+    end: pick(flat, FIELD_END_KEY, [/\bend/i, /expire/i, /finish/i]),
+    details: pick(flat, FIELD_DETAILS_KEY, [/detail/i, /descrip/i, /message/i]),
+    contact: pick(flat, FIELD_CONTACT_KEY, [/contact/i, /email/i]) ||
+             stringify(sub.email) || "",
+    createdAt: sub.createdAt || sub.dateAdded || "",
+  };
+}
+
+/* =================== OPPORTUNITY MODE ==================== */
+
+function getCustomField(opp, fieldId) {
+  if (!fieldId || !Array.isArray(opp.customFields)) return "";
+  const m = opp.customFields.find(
+    (f) => f.id === fieldId || f.customFieldId === fieldId || f.key === fieldId
+  );
+  if (!m) return "";
+  const v = m.fieldValue ?? m.value ?? m.field_value ?? m.fieldValueString ?? m.selectedOptions ?? "";
+  return Array.isArray(v) ? v.join(", ") : String(v ?? "");
+}
+
+function opportunityToPromotion(opp) {
+  const c = opp.contact || {};
+  return {
+    id: opp.id,
+    name: opp.name || "",
+    audience: getCustomField(opp, CF_AUDIENCE_ID),
+    start: getCustomField(opp, CF_START_ID),
+    end: getCustomField(opp, CF_END_ID),
+    details: getCustomField(opp, CF_DETAILS_ID),
+    contact: c.email || c.name || [c.firstName, c.lastName].filter(Boolean).join(" ") || "",
+  };
+}
+
+function opportunityPasses(opp) {
+  if (PROMO_PIPELINE_ID) return opp.pipelineId === PROMO_PIPELINE_ID;
+  const kws = PROMO_KEYWORDS.split(",").map((k) => k.trim().toLowerCase()).filter(Boolean);
+  if (!kws.length) return true;
+  return kws.some((k) => (opp.name || "").toLowerCase().includes(k));
+}
+
+function fetchOpportunities() {
+  const path =
+    `/opportunities/search?location_id=${encodeURIComponent(GHL_LOCATION_ID)}&limit=100`;
+  return ghlGet(path).then((d) => d.opportunities || []);
+}
+
+/* ======================= ROUTES ========================= */
+
+function configOK(res) {
+  if (!GHL_PIT || !GHL_LOCATION_ID) {
+    res.status(500).json({ error: "Server not configured: set GHL_PIT and GHL_LOCATION_ID." });
+    return false;
+  }
+  if (DATA_SOURCE === "form" && !FORM_ID) {
+    res.status(500).json({ error: "Form mode needs FORM_ID set." });
+    return false;
+  }
+  return true;
+}
+
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "smart1-promos-proxy" });
+  res.json({ ok: true, service: "smart1-promos-proxy", dataSource: DATA_SOURCE });
 });
 
-// ---- Main feed the promotions page calls ----
-app.get("/promotions", async (req, res) => {
-  if (!GHL_PIT || !GHL_LOCATION_ID) {
-    return res
-      .status(500)
-      .json({ error: "Server not configured: set GHL_PIT and GHL_LOCATION_ID." });
+async function buildPromotions() {
+  if (DATA_SOURCE === "opportunity") {
+    const opps = await fetchOpportunities();
+    return opps.filter(opportunityPasses).map(opportunityToPromotion);
   }
+  const subs = await fetchSubmissions();
+  return subs.map(submissionToPromotion).filter((p) => p.name); // must have a name
+}
 
-  // Serve from cache when fresh
+app.get("/promotions", async (req, res) => {
+  if (!configOK(res)) return;
   if (cache.data && Date.now() - cache.at < CACHE_MS) {
     return res.json({ promotions: cache.data, cached: true });
   }
-
   try {
-    const opps = await fetchOpportunities();
-    const promotions = opps.filter(passesFilter).map(toPromotion);
+    const promotions = await buildPromotions();
     cache = { data: promotions, at: Date.now() };
     res.json({ promotions, cached: false });
   } catch (err) {
@@ -166,75 +250,53 @@ app.get("/promotions", async (req, res) => {
   }
 });
 
-// ---- Helper: list custom field definitions so you can grab the IDs ----
-// Visit https://your-service.onrender.com/custom-fields once during setup,
-// copy the IDs you need into the CF_* env vars, then you can ignore this.
-app.get("/custom-fields", async (req, res) => {
-  if (!GHL_PIT || !GHL_LOCATION_ID) {
-    return res
-      .status(500)
-      .json({ error: "Server not configured: set GHL_PIT and GHL_LOCATION_ID." });
-  }
-  try {
-    const url = `${GHL_BASE}/locations/${encodeURIComponent(
-      GHL_LOCATION_ID
-    )}/customFields?model=opportunity`;
-    const resp = await fetch(url, { headers: ghlHeaders() });
-    const data = await resp.json();
-    const fields = (data.customFields || []).map((f) => ({
-      id: f.id,
-      name: f.name,
-      dataType: f.dataType,
-      fieldKey: f.fieldKey,
-    }));
-    res.json({ customFields: fields });
-  } catch (err) {
-    res.status(502).json({ error: err.message });
-  }
-});
-
-// ---- Debug: see what GHL actually returns (names, pipelines, custom fields) ----
-// Visit https://your-service.onrender.com/debug during setup, then remove/ignore.
+// Raw diagnostics — shows exactly what GHL returns so we can map fields.
 app.get("/debug", async (req, res) => {
-  if (!GHL_PIT || !GHL_LOCATION_ID) {
-    return res
-      .status(500)
-      .json({ error: "Server not configured: set GHL_PIT and GHL_LOCATION_ID." });
-  }
+  if (!configOK(res)) return;
   try {
-    const opps = await fetchOpportunities();
+    if (DATA_SOURCE === "opportunity") {
+      const opps = await fetchOpportunities();
+      return res.json({
+        dataSource: "opportunity",
+        totalOpportunities: opps.length,
+        matched: opps.filter(opportunityPasses).length,
+        sample: opps.slice(0, 3),
+      });
+    }
+    const subs = await fetchSubmissions();
     res.json({
-      totalOpportunities: opps.length,
-      activeFilter: PROMO_PIPELINE_ID
-        ? `pipelineId === ${PROMO_PIPELINE_ID}`
-        : `name contains one of: ${PROMO_KEYWORDS}`,
-      matchedAsPromotions: opps.filter(passesFilter).length,
-      opportunities: opps.map((o) => ({
-        id: o.id,
-        name: o.name,
-        status: o.status,
-        pipelineId: o.pipelineId,
-        pipelineStageId: o.pipelineStageId,
-        contact: o.contact
-          ? { name: o.contact.name, email: o.contact.email }
-          : null,
-        customFields: (o.customFields || []).map((f) => ({
-          id: f.id || f.customFieldId || f.key,
-          value:
-            f.fieldValue ??
-            f.value ??
-            f.field_value ??
-            f.fieldValueString ??
-            f.selectedOptions ??
-            "",
-        })),
-      })),
+      dataSource: "form",
+      formId: FORM_ID,
+      totalSubmissions: subs.length,
+      // raw first few, plus how we'd flatten + map them
+      rawSample: subs.slice(0, 3),
+      flattenedSample: subs.slice(0, 3).map(flattenSubmission),
+      mappedSample: subs.slice(0, 3).map(submissionToPromotion),
     });
   } catch (err) {
     res.status(err.status || 502).json({ error: err.message });
   }
 });
 
+// Helper for opportunity mode: list custom field IDs
+app.get("/custom-fields", async (req, res) => {
+  if (!GHL_PIT || !GHL_LOCATION_ID) {
+    return res.status(500).json({ error: "Set GHL_PIT and GHL_LOCATION_ID." });
+  }
+  try {
+    const data = await ghlGet(
+      `/locations/${encodeURIComponent(GHL_LOCATION_ID)}/customFields?model=opportunity`
+    );
+    res.json({
+      customFields: (data.customFields || []).map((f) => ({
+        id: f.id, name: f.name, dataType: f.dataType, fieldKey: f.fieldKey,
+      })),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
-  console.log(`Smart 1 promos proxy listening on ${PORT}`);
+  console.log(`Smart 1 promos proxy (${DATA_SOURCE} mode) listening on ${PORT}`);
 });
