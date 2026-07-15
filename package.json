@@ -1,0 +1,16 @@
+{
+  "name": "smart1-promos-proxy",
+  "version": "1.0.0",
+  "description": "Secure server-side proxy that reads promotion opportunities from Smart 1 Suite (GoHighLevel) using a Private Integration Token, so the token never touches the browser.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
